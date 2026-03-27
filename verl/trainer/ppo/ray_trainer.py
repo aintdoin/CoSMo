@@ -19,6 +19,7 @@ This trainer supports model-agonistic model initialization with huggingface
 import os
 import re
 import uuid
+import ast
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from enum import Enum
@@ -633,345 +634,293 @@ class RayPPOTrainer(object):
         self.validation_table = new_table
 
     def _validate(self, log_sample=False, global_step=0):
-        import os  # 确保在方法内部能访问到os模块
-        answer_tensor_lst = []
-        reward_tensor_lst = []
-        base_reward_tensor_lst = []  # NEW: Store original judge results (without penalty)
-        data_source_lst = []
-        answerable_flags_lst = []  # NEW: Store answerable flags for each sample
+        # Minimal validation metrics aligned with inference.py:
+        # - Accuracy
+        # - Average Token Cost (avg generated token length)
+        # - Average Segments (avg numbered segments in reasoning)
+        def _normalize_val_files(val_files):
+            if val_files is None:
+                return []
+            if isinstance(val_files, (list, tuple)):
+                return list(val_files)
+            if isinstance(val_files, str):
+                s = val_files.strip()
+                if (s.startswith('[') and s.endswith(']')) or (s.startswith('(') and s.endswith(')')):
+                    try:
+                        parsed = ast.literal_eval(s)
+                        if isinstance(parsed, (list, tuple)):
+                            return list(parsed)
+                    except Exception:
+                        pass
+                return [val_files]
+            return [str(val_files)]
 
-        # Lists to collect samples for the table
-        sample_inputs = []
-        sample_outputs = []
-        sample_scores = []
+        def _infer_dataset_name(parquet_path: str) -> str:
+            p = str(parquet_path)
+            base = os.path.basename(p)
+            parent = os.path.basename(os.path.dirname(p))
+            name = parent or os.path.splitext(base)[0]
+            # Avoid generic parent dir names
+            if name.lower() in {'data', 'dataset', 'datasets'}:
+                name = os.path.splitext(base)[0]
+            return name
 
-        for test_data in self.val_dataloader:
-            test_batch = DataProto.from_single_dict(test_data)
+        def _count_segments(text: str) -> int:
+            if not isinstance(text, str) or not text:
+                return 0
+            m = re.search(r'<think>(.*?)</think>', text, re.DOTALL | re.IGNORECASE)
+            content = m.group(1) if m else text
+            enum_pattern = re.compile(r'(?m)^(\s*)(\d+)\.(\s*)')
+            return len(list(enum_pattern.finditer(content)))
 
-            # Extract and store answerable flags for each sample in this batch
-            batch_answerable_flags = []
-            try:
-                non_tensor = test_batch.non_tensor_batch
-                # Safely get extra_info or extra_infos (avoid numpy array truth value error)
-                extra_infos = non_tensor.get('extra_info', None)
-                if extra_infos is None:
-                    extra_infos = non_tensor.get('extra_infos', None)
-                answerable_false_count = 0
-                answerable_true_count = 0
-                unknown_count = 0
-                if isinstance(extra_infos, list):
-                    for ei in extra_infos:
-                        if isinstance(ei, dict):
-                            flag = ei.get('answerable', None)
-                            if flag is False:
-                                answerable_false_count += 1
-                                batch_answerable_flags.append(False)
-                            elif flag is True:
-                                answerable_true_count += 1
-                                batch_answerable_flags.append(True)
-                            else:
-                                unknown_count += 1
-                                batch_answerable_flags.append(None)
-                        else:
-                            batch_answerable_flags.append(None)
-                else:
-                    # If extra_infos is not a list, create None flags for all samples
-                    batch_size = test_batch.batch['input_ids'].shape[0]
-                    batch_answerable_flags = [None] * batch_size
-            except Exception as e:
-                # On error, create None flags
-                batch_size = test_batch.batch['input_ids'].shape[0]
-                batch_answerable_flags = [None] * batch_size
-            
-            answerable_flags_lst.extend(batch_answerable_flags)
-            # Store original inputs
-            input_ids = test_batch.batch['input_ids']
-            input_texts = [self.tokenizer.decode(ids, skip_special_tokens=True) for ids in input_ids]
-            sample_inputs.extend(input_texts)
+        # Use the same LLM-as-a-Judge as inference.py
+        from verl.utils.reward_score.answer_postprocessor import get_postprocessor
+        post = get_postprocessor()
 
-            test_gen_batch = test_batch.pop(['input_ids', 'attention_mask', 'position_ids'])
-            test_gen_batch.meta_info = {
-                'eos_token_id': self.tokenizer.eos_token_id,
-                'pad_token_id': self.tokenizer.pad_token_id,
-                'recompute_log_prob': False,
-                'do_sample': False,
-                'validate': True,
+        def _run_validate_on_dataloader(val_dataloader, dataset_tag: str | None):
+            import torch
+
+            answer_tensor_lst = []
+            token_len_lst = []
+            segment_cnt_lst = []
+
+            # Lists to collect samples for the table
+            sample_inputs = []
+            sample_outputs = []
+            sample_scores = []
+
+            nonlocal log_sample
+            for test_data in val_dataloader:
+                test_batch = DataProto.from_single_dict(test_data)
+
+                # Store original inputs
+                input_ids = test_batch.batch['input_ids']
+                input_texts = [self.tokenizer.decode(ids, skip_special_tokens=True) for ids in input_ids]
+                if dataset_tag:
+                    input_texts = [f"[{dataset_tag}] {t}" for t in input_texts]
+                sample_inputs.extend(input_texts)
+
+                test_gen_batch = test_batch.pop(['input_ids', 'attention_mask', 'position_ids'])
+                test_gen_batch.meta_info = {
+                    'eos_token_id': self.tokenizer.eos_token_id,
+                    'pad_token_id': self.tokenizer.pad_token_id,
+                    'recompute_log_prob': False,
+                    'do_sample': False,
+                    'validate': True,
+                }
+
+                # pad to be divisible by dp_size
+                test_gen_batch_padded, pad_size = pad_dataproto_to_divisor(test_gen_batch, self.actor_rollout_wg.world_size)
+                test_output_gen_batch_padded = self.actor_rollout_wg.generate_sequences(test_gen_batch_padded)
+                # unpad
+                test_output_gen_batch = unpad_dataproto(test_output_gen_batch_padded, pad_size=pad_size)
+
+                if log_sample:
+                    # Log the first sample of the first batch
+                    try:
+                        # Decode prompt, handling padding correctly
+                        prompt_ids = test_batch.batch['input_ids'][0]
+                        prompt_mask = test_batch.batch['attention_mask'][0]
+                        valid_prompt_ids = prompt_ids[prompt_mask.bool()]
+                        prompt_str = self.tokenizer.decode(valid_prompt_ids, skip_special_tokens=True)
+
+                        # Decode and clean response
+                        response_ids = test_output_gen_batch.batch['responses'][0]
+                        response_str = self.tokenizer.decode(response_ids, skip_special_tokens=True)
+                        cleaned_response = re.sub(r'\n{2,}', '\n', response_str).strip()
+
+                        header = f" Initial Validation Sample " if global_step == 0 else f" Validation Sample @ Step {global_step} "
+                        if dataset_tag:
+                            header = header.strip() + f" [{dataset_tag}] "
+                        print("\n" + "*" * 80)
+                        print(header.center(80, '*'))
+                        print("--- PROMPT ---")
+                        print(prompt_str)
+                        print("\n--- RESPONSE (cleaned) ---")
+                        print(cleaned_response)
+                        print("*" * 80 + "\n")
+                    except Exception as e:
+                        print(f"Failed to log validation sample: {e}")
+                    log_sample = False  # Only log one sample per validation run
+
+                print('validation generation end AND validation evaluation start')
+
+                # Store generated outputs
+                output_ids = test_output_gen_batch.batch['responses']
+                output_texts = [self.tokenizer.decode(ids, skip_special_tokens=True) for ids in output_ids]
+                sample_outputs.extend(output_texts)
+
+                # Token cost: count non-pad tokens in generated response ids (align with inference.py token_count)
+                pad_id = self.tokenizer.pad_token_id
+                try:
+                    valid_token_lens = (output_ids != pad_id).sum(dim=-1).detach().cpu().tolist()
+                except Exception:
+                    # Fallback: assume full length
+                    valid_token_lens = [int(output_ids.shape[-1])] * int(output_ids.shape[0])
+                token_len_lst.extend([int(x) for x in valid_token_lens])
+
+                # Segments: count numbered segments inside <think> if present, else full text
+                segment_cnt_lst.extend([_count_segments(t) for t in output_texts])
+
+                test_batch = test_batch.union(test_output_gen_batch)
+
+                # Judge correctness in a way consistent with inference.py
+                bs = int(output_ids.shape[0])
+                gts = test_batch.non_tensor_batch.get('ground_truth', [''] * bs)
+                qs = test_batch.non_tensor_batch.get('query', [''] * bs)
+
+                # Normalize to python lists (can be numpy arrays)
+                try:
+                    gts_list = list(gts)
+                except Exception:
+                    gts_list = [gts] * bs
+                try:
+                    qs_list = list(qs)
+                except Exception:
+                    qs_list = [qs] * bs
+
+                items = []
+                for i in range(bs):
+                    items.append({
+                        'predicted_answer': output_texts[i],
+                        'ground_truth_answer': gts_list[i] if i < len(gts_list) else '',
+                        'question': qs_list[i] if i < len(qs_list) else '',
+                        'answerable': None,
+                    })
+
+                judge_scores = post.judge_batch(items)
+                # Map judge scores to {0,1} correctness
+                correct_flags = [1.0 if s == 1 else 0.0 for s in judge_scores]
+                sample_scores.extend([float(s) for s in correct_flags])
+                answer_tensor_lst.append(torch.tensor(correct_flags, dtype=torch.float32))
+
+            if answer_tensor_lst:
+                answer_tensor = torch.cat(answer_tensor_lst, dim=0).cpu()
+            else:
+                answer_tensor = torch.zeros((0,), dtype=torch.float32)
+
+            n = int(answer_tensor.shape[0])
+            acc = float((answer_tensor >= 0.5).float().mean().item()) if n > 0 else 0.0
+            avg_token_cost = float(sum(token_len_lst) / len(token_len_lst)) if token_len_lst else 0.0
+            avg_segments = float(sum(segment_cnt_lst) / len(segment_cnt_lst)) if segment_cnt_lst else 0.0
+
+            return {
+                "val/accuracy": acc,
+                "val/avg_token_cost": avg_token_cost,
+                "val/avg_segments": avg_segments,
+                "_n": n,
+                "_sum_correct": float(answer_tensor.sum().item()) if n > 0 else 0.0,
+                "_sum_tokens": float(sum(token_len_lst)),
+                "_sum_segments": float(sum(segment_cnt_lst)),
+                "_sample_inputs": sample_inputs,
+                "_sample_outputs": sample_outputs,
+                "_sample_scores": sample_scores,
             }
 
-            # pad to be divisible by dp_size
-            test_gen_batch_padded, pad_size = pad_dataproto_to_divisor(test_gen_batch, self.actor_rollout_wg.world_size)
-            test_output_gen_batch_padded = self.actor_rollout_wg.generate_sequences(test_gen_batch_padded)
-            # unpad
-            test_output_gen_batch = unpad_dataproto(test_output_gen_batch_padded, pad_size=pad_size)
+        val_files = _normalize_val_files(self.config.data.val_files)
+        if len(val_files) <= 1:
+            out = _run_validate_on_dataloader(self.val_dataloader, dataset_tag=None)
+            self._maybe_log_val_generations_to_wandb(inputs=out["_sample_inputs"],
+                                                     outputs=out["_sample_outputs"],
+                                                     scores=out["_sample_scores"])
+            return {
+                "val/accuracy": out["val/accuracy"],
+                "val/avg_token_cost": out["val/avg_token_cost"],
+                "val/avg_segments": out["val/avg_segments"],
+                # Aliases aligned with inference.py naming
+                "val/avg_tokens": out["val/avg_token_cost"],
+                "val/avg_steps": out["val/avg_segments"],
+            }
 
-            if log_sample:
-                # Log the first sample of the first batch
-                try:
-                    # Decode prompt, handling padding correctly
-                    prompt_ids = test_batch.batch['input_ids'][0]
-                    prompt_mask = test_batch.batch['attention_mask'][0]
-                    valid_prompt_ids = prompt_ids[prompt_mask.bool()]
-                    prompt_str = self.tokenizer.decode(valid_prompt_ids, skip_special_tokens=True)
+        # Multiple datasets: validate per file (dataset) and also compute a weighted overall.
+        from torch.utils.data import DataLoader
 
-                    # Decode and clean response
-                    response_ids = test_output_gen_batch.batch['responses'][0]
-                    response_str = self.tokenizer.decode(response_ids, skip_special_tokens=True)
-                    cleaned_response = re.sub(r'\n{2,}', '\n', response_str).strip()
+        total_n = 0
+        total_correct = 0.0
+        total_tokens = 0.0
+        total_segments = 0.0
 
-                    header = f" Initial Validation Sample " if global_step == 0 else f" Validation Sample @ Step {global_step} "
-                    print("\n" + "*" * 80)
-                    print(header.center(80, '*'))
-                    print("--- PROMPT ---")
-                    print(prompt_str)
-                    print("\n--- RESPONSE (cleaned) ---")
-                    print(cleaned_response)
-                    print("*" * 80 + "\n")
-                except Exception as e:
-                    print(f"Failed to log validation sample: {e}")
-                log_sample = False  # Only log one sample per validation run
+        global_sample_inputs = []
+        global_sample_outputs = []
+        global_sample_scores = []
 
-            print('validation generation end AND validation evaluation start')
+        metric_dict: dict[str, float] = {}
 
-            # Store generated outputs
-            output_ids = test_output_gen_batch.batch['responses']
-            output_texts = [self.tokenizer.decode(ids, skip_special_tokens=True) for ids in output_ids]
-            sample_outputs.extend(output_texts)
+        # Make dataset tags unique (in case of duplicate folder names)
+        seen_tags: dict[str, int] = {}
+        for parquet_path in val_files:
+            tag = _infer_dataset_name(parquet_path)
+            seen_tags[tag] = seen_tags.get(tag, 0) + 1
+            if seen_tags[tag] > 1:
+                tag = f"{tag}_{seen_tags[tag]}"
 
-            test_batch = test_batch.union(test_output_gen_batch)
-            # evaluate using reward_function
-            reward_tensor, format_tensor, answer_tensor, base_reward_tensor = self.val_reward_fn(test_batch)
-            # Store scores
-            scores = reward_tensor.sum(-1).cpu().tolist()
-            sample_scores.extend(scores)
-
-            answer_tensor_lst.append(answer_tensor)
-            reward_tensor_lst.append(reward_tensor)
-            base_reward_tensor_lst.append(base_reward_tensor)
-            data_source_lst.append(test_batch.non_tensor_batch.get('data_source', ['unknown'] * reward_tensor.shape[0]))
-
-        self._maybe_log_val_generations_to_wandb(inputs=sample_inputs, outputs=sample_outputs, scores=sample_scores)
-
-        answer_tensor = torch.cat(answer_tensor_lst, dim=0).cpu()
-        reward_tensor = torch.cat(reward_tensor_lst, dim=0).sum(-1).cpu()  # (batch_size,)
-        base_reward_tensor = torch.cat(base_reward_tensor_lst, dim=0).cpu()  # Original judge results
-        data_sources = np.concatenate(data_source_lst, axis=0)
-        answerable_flags = np.array(answerable_flags_lst, dtype=object)  # Convert to numpy array
-
-        # evaluate test_score based on data source
-        data_source_answer_reward = {}
-        data_source_reward = {}
-        for i in range(answer_tensor.shape[0]):
-            data_source = data_sources[i]
-
-            if data_source not in data_source_answer_reward:
-                data_source_answer_reward[data_source] = []
-
-            if data_source not in data_source_reward:
-                data_source_reward[data_source] = []
-
-            data_source_answer_reward[data_source].append(answer_tensor[i].item())
-            data_source_reward[data_source].append(reward_tensor[i].item())
-
-        # compute n_correct / n_miss / hallucination / score per data_source
-        # NEW: Use base_reward (original judge result) for test_score calculation
-        # This ensures evaluation metrics are independent of training penalties
-        # alignment: sample_outputs[i] corresponds to base_reward_tensor[i] and data_sources[i]
-        # IMPORTANT: enforce mutual exclusivity based on mapped answer score {-1, 0, 1}
-        counts = {}
-        counts_answerable_true = {}  # NEW: Counts for answerable=True samples
-        counts_answerable_false = {}  # NEW: Counts for answerable=False samples
-        
-        total_samples = len(sample_outputs)
-        for i in range(len(data_sources)):
-            ds = data_sources[i]
-            answerable_flag = answerable_flags[i] if i < len(answerable_flags) else None
-            
-            # Overall counts
-            if ds not in counts:
-                counts[ds] = {"n": 0, "n_correct": 0, "n_miss": 0, "n_incorrect": 0}
-            counts[ds]["n"] += 1
-
-            # Use base_reward (without length penalty) for test_score calculation
-            base_val = float(base_reward_tensor[i].item())
-            if base_val >= 0.999:
-                # correct
-                counts[ds]["n_correct"] += 1
-            elif base_val <= -0.999:
-                # incorrect / hallucination
-                counts[ds]["n_incorrect"] += 1
+            ds = RLHFDataset(parquet_files=[parquet_path],
+                             tokenizer=self.tokenizer,
+                             prompt_key=self.config.data.prompt_key,
+                             max_prompt_length=self.config.data.max_prompt_length,
+                             filter_prompts=self.config.data.filter_overlong_prompts,
+                             return_raw_chat=self.config.data.get('return_raw_chat', False),
+                             truncation='error',
+                             disable_unanswerable=False)
+            if len(ds) == 0:
+                per = {"val/accuracy": 0.0, "val/avg_token_cost": 0.0, "val/avg_segments": 0.0, "_n": 0,
+                       "_sum_correct": 0.0, "_sum_tokens": 0.0, "_sum_segments": 0.0,
+                       "_sample_inputs": [], "_sample_outputs": [], "_sample_scores": []}
             else:
-                # mapped as 0 → IDK/miss
-                counts[ds]["n_miss"] += 1
-            
-            # Separate counts by answerable flag
-            if answerable_flag is True:
-                if ds not in counts_answerable_true:
-                    counts_answerable_true[ds] = {"n": 0, "n_correct": 0, "n_miss": 0, "n_incorrect": 0}
-                counts_answerable_true[ds]["n"] += 1
-                if base_val >= 0.999:
-                    counts_answerable_true[ds]["n_correct"] += 1
-                elif base_val <= -0.999:
-                    counts_answerable_true[ds]["n_incorrect"] += 1
-                else:
-                    counts_answerable_true[ds]["n_miss"] += 1
-                    
-            elif answerable_flag is False:
-                if ds not in counts_answerable_false:
-                    counts_answerable_false[ds] = {"n": 0, "n_correct": 0, "n_miss": 0, "n_incorrect": 0}
-                counts_answerable_false[ds]["n"] += 1
-                if base_val >= 0.999:
-                    counts_answerable_false[ds]["n_correct"] += 1
-                elif base_val <= -0.999:
-                    counts_answerable_false[ds]["n_incorrect"] += 1
-                else:
-                    counts_answerable_false[ds]["n_miss"] += 1
+                dl = DataLoader(dataset=ds,
+                                batch_size=len(ds),
+                                num_workers=8,
+                                shuffle=False,
+                                drop_last=False,
+                                collate_fn=collate_fn)
+                per = _run_validate_on_dataloader(dl, dataset_tag=tag)
 
-        metric_dict = {}
-        for data_source in data_source_answer_reward.keys():
-            # answer_reward = data_source_answer_reward[data_source]
-            # Removed duplicate test_answer_score as it's redundant with test_score
-            
-            # derive ratios for overall counts
-            c = counts.get(data_source, {"n": 0, "n_correct": 0, "n_miss": 0})
-            n = c["n"]
-            if n <= 0:
-                n_correct_ratio = 0.0
-                n_miss_ratio = 0.0
-                hallucination_ratio = 0.0
-                final_score = 0.0
-            else:
-                n_correct_ratio = c["n_correct"] / n
-                n_miss_ratio = c["n_miss"] / n
-                # with mutual exclusivity, hallucination == incorrect ratio
-                hallucination_ratio = c.get("n_incorrect", 0) / n
-                final_score = 2.0 * n_correct_ratio + n_miss_ratio - 1.0
+            # Print per-dataset summary for readability (esp. val_before_train)
+            print("\n" + "-" * 80)
+            print(f" Validation Metrics [{tag}] ".center(80, '-'))
+            pprint({
+                "val/accuracy": per["val/accuracy"],
+                "val/avg_token_cost": per["val/avg_token_cost"],
+                "val/avg_segments": per["val/avg_segments"],
+                "val/avg_tokens": per["val/avg_token_cost"],
+                "val/avg_steps": per["val/avg_segments"],
+                "val/n": per["_n"],
+            })
 
-            metric_dict[f'val/test_n_correct/{data_source}'] = n_correct_ratio
-            metric_dict[f'val/test_n_miss/{data_source}'] = n_miss_ratio
-            metric_dict[f'val/test_hallucination/{data_source}'] = hallucination_ratio
-            metric_dict[f'val/test_score/{data_source}'] = final_score
+            n_i = int(per["_n"])
+            total_n += n_i
+            total_correct += float(per["_sum_correct"])
+            total_tokens += float(per["_sum_tokens"])
+            total_segments += float(per["_sum_segments"])
 
-            # NEW: Compute and log metrics for answerable=True samples
-            c_true = counts_answerable_true.get(data_source, {"n": 0, "n_correct": 0, "n_miss": 0, "n_incorrect": 0})
-            n_true = c_true["n"]
-            if n_true > 0:
-                metric_dict[f'val/test_n_correct_answerable_true/{data_source}'] = c_true["n_correct"] / n_true
-                metric_dict[f'val/test_n_miss_answerable_true/{data_source}'] = c_true["n_miss"] / n_true
-                metric_dict[f'val/test_hallucination_answerable_true/{data_source}'] = c_true.get("n_incorrect", 0) / n_true
-                # For answerable=True: correct should be high, miss should be low
-                score_true = 2.0 * (c_true["n_correct"] / n_true) + (c_true["n_miss"] / n_true) - 1.0
-                metric_dict[f'val/test_score_answerable_true/{data_source}'] = score_true
+            global_sample_inputs.extend(per["_sample_inputs"])
+            global_sample_outputs.extend(per["_sample_outputs"])
+            global_sample_scores.extend(per["_sample_scores"])
 
-            # NEW: Compute and log metrics for answerable=False samples
-            c_false = counts_answerable_false.get(data_source, {"n": 0, "n_correct": 0, "n_miss": 0, "n_incorrect": 0})
-            n_false = c_false["n"]
-            if n_false > 0:
-                metric_dict[f'val/test_n_correct_answerable_false/{data_source}'] = c_false["n_correct"] / n_false
-                metric_dict[f'val/test_n_miss_answerable_false/{data_source}'] = c_false["n_miss"] / n_false
-                metric_dict[f'val/test_hallucination_answerable_false/{data_source}'] = c_false.get("n_incorrect", 0) / n_false
-                # For answerable=False: correct (IDK) should be high, incorrect should be low
-                score_false = 2.0 * (c_false["n_correct"] / n_false) + (c_false["n_miss"] / n_false) - 1.0
-                metric_dict[f'val/test_score_answerable_false/{data_source}'] = score_false
+            metric_dict[f"val/{tag}/accuracy"] = float(per["val/accuracy"])
+            metric_dict[f"val/{tag}/avg_token_cost"] = float(per["val/avg_token_cost"])
+            metric_dict[f"val/{tag}/avg_segments"] = float(per["val/avg_segments"])
+            metric_dict[f"val/{tag}/avg_tokens"] = float(per["val/avg_token_cost"])
+            metric_dict[f"val/{tag}/avg_steps"] = float(per["val/avg_segments"])
+            metric_dict[f"val/{tag}/n"] = float(n_i)
 
-        # Calculate and store THS (Truthful Helpfulness Score)
-        # For initial validation (global_step=0), store x0 and y0
-        if global_step == 0:
-            # Compute average correct rate (x0) and hallucination rate (y0) across all data sources
-            x0_values = [metric_dict.get(f'val/test_n_correct/{ds}', 0.0) for ds in counts.keys()]
-            y0_values = [metric_dict.get(f'val/test_hallucination/{ds}', 0.0) for ds in counts.keys()]
-            
-            if x0_values and y0_values:
-                x0 = sum(x0_values) / len(x0_values)  # Average correct rate
-                y0 = sum(y0_values) / len(y0_values)  # Average hallucination rate
-                self.initial_validation_metrics = {'x0': x0, 'y0': y0}
-                print(f"\n🔍 Initial Validation Metrics stored for THS calculation:")
-                print(f"   x0 (initial correct rate): {x0:.4f}")
-                print(f"   y0 (initial hallucination rate): {y0:.4f}")
-        else:
-            # For subsequent validations, calculate THS
-            if self.initial_validation_metrics is not None:
-                x0 = self.initial_validation_metrics['x0']
-                y0 = self.initial_validation_metrics['y0']
-                
-                # Get current correct rate (x1) and hallucination rate (y1)
-                x1_values = [metric_dict.get(f'val/test_n_correct/{ds}', 0.0) for ds in counts.keys()]
-                y1_values = [metric_dict.get(f'val/test_hallucination/{ds}', 0.0) for ds in counts.keys()]
-                
-                if x1_values and y1_values:
-                    x1 = sum(x1_values) / len(x1_values)  # Average current correct rate
-                    y1 = sum(y1_values) / len(y1_values)  # Average current hallucination rate
-                    
-                    # Calculate THS = (x1*y0 - y1*x0) / y0
-                    if y0 > 0:  # Avoid division by zero
-                        ths = (x1 * y0 - y1 * x0) / y0
-                        metric_dict['val/ths'] = ths
-                        print(f"\n📊 Truthful Helpfulness Score (THS): {ths:.4f}")
-                        print(f"   x0={x0:.4f}, y0={y0:.4f}, x1={x1:.4f}, y1={y1:.4f}")
-                    else:
-                        print("\n⚠️ Cannot calculate THS: initial hallucination rate (y0) is zero")
-                        metric_dict['val/ths'] = 0.0
-            else:
-                print("\n⚠️ Cannot calculate THS: initial validation metrics not available")
-                metric_dict['val/ths'] = 0.0
-        
-        # Save validation test_score for dynamic IDK penalty
-        # Use test_score (not just n_correct) as it considers both correct and miss
-        import os
-        enable_dynamic_idk = os.environ.get('ENABLE_DYNAMIC_IDK_PENALTY', 'false').lower() == 'true'
-        if enable_dynamic_idk:
-            # Calculate average test_score across all data sources
-            test_scores = [metric_dict.get(f'val/test_score/{ds}', 0.0) for ds in counts.keys()]
-            if test_scores:
-                avg_test_score = sum(test_scores) / len(test_scores)
-                # Save to a file in the checkpoint directory
-                state_file = os.path.join(self.config.trainer.default_local_dir, 'dynamic_idk_state.txt')
-                os.makedirs(os.path.dirname(state_file), exist_ok=True)
-                with open(state_file, 'w') as f:
-                    f.write(f"{avg_test_score:.6f}\n")
-                print(f"\n🎯 [Dynamic IDK] Updated test_score: {avg_test_score:.4f}")
-                print(f"   Saved to: {state_file}")
-        
-        # Enhanced print with detailed breakdowns by answerable flag
-        try:
-            print("\n" + "=" * 80)
-            print(" Validation Results Summary ".center(80, "="))
-            print("=" * 80)
-            
-            for ds, c in counts.items():
-                print(f"\n[{ds}] Overall: n={c['n']}, correct={c['n_correct']}, miss={c['n_miss']}, incorrect={c.get('n_incorrect', 0)}")
-                
-                # Print answerable=True stats (all three categories are valid)
-                c_true = counts_answerable_true.get(ds, {"n": 0, "n_correct": 0, "n_miss": 0, "n_incorrect": 0})
-                if c_true["n"] > 0:
-                    correct_pct = 100.0 * c_true["n_correct"] / c_true["n"]
-                    miss_pct = 100.0 * c_true["n_miss"] / c_true["n"]
-                    incorrect_pct = 100.0 * c_true.get("n_incorrect", 0) / c_true["n"]
-                    print(f"  └─ [answerable=True]  n={c_true['n']}, correct={c_true['n_correct']} ({correct_pct:.1f}%), "
-                          f"miss={c_true['n_miss']} ({miss_pct:.1f}%), incorrect={c_true.get('n_incorrect', 0)} ({incorrect_pct:.1f}%)")
-                
-                # Print answerable=False stats (only correct/incorrect should exist)
-                c_false = counts_answerable_false.get(ds, {"n": 0, "n_correct": 0, "n_miss": 0, "n_incorrect": 0})
-                if c_false["n"] > 0:
-                    correct_pct = 100.0 * c_false["n_correct"] / c_false["n"]
-                    incorrect_pct = 100.0 * c_false.get("n_incorrect", 0) / c_false["n"]
-                    # For answerable=False, only show correct and incorrect (miss should be 0)
-                    miss_count = c_false["n_miss"]
-                    if miss_count > 0:
-                        # Warning: miss should not exist for answerable=False
-                        print(f"  └─ [answerable=False] n={c_false['n']}, correct={c_false['n_correct']} ({correct_pct:.1f}%), "
-                              f"incorrect={c_false.get('n_incorrect', 0)} ({incorrect_pct:.1f}%) "
-                              f"⚠️ UNEXPECTED miss={miss_count}")
-                    else:
-                        print(f"  └─ [answerable=False] n={c_false['n']}, correct={c_false['n_correct']} ({correct_pct:.1f}%), "
-                              f"incorrect={c_false.get('n_incorrect', 0)} ({incorrect_pct:.1f}%)")
-            
-            print("=" * 80 + "\n")
-        except Exception as e:
-            print(f"[Warning] Failed to print detailed validation counts: {e}")
-            # Fallback to simple print
-            for ds, c in counts.items():
-                print(f"[Validation Counts] {ds} -> n={c['n']}, correct={c['n_correct']}, miss={c['n_miss']}, incorrect={c.get('n_incorrect', 0)}")
+        self._maybe_log_val_generations_to_wandb(inputs=global_sample_inputs,
+                                                 outputs=global_sample_outputs,
+                                                 scores=global_sample_scores)
 
+        overall_acc = float(total_correct / total_n) if total_n > 0 else 0.0
+        overall_avg_token_cost = float(total_tokens / total_n) if total_n > 0 else 0.0
+        overall_avg_segments = float(total_segments / total_n) if total_n > 0 else 0.0
+
+        # Keep the original overall keys for backward compatibility.
+        metric_dict.update({
+            "val/accuracy": overall_acc,
+            "val/avg_token_cost": overall_avg_token_cost,
+            "val/avg_segments": overall_avg_segments,
+            "val/avg_tokens": overall_avg_token_cost,
+            "val/avg_steps": overall_avg_segments,
+            "val/n": float(total_n),
+        })
         return metric_dict
 
     def init_workers(self):
@@ -1173,10 +1122,11 @@ class RayPPOTrainer(object):
             logger.log(data=val_metrics, step=self.global_steps)
             if self.config.trainer.get('val_only', False):
                 return
+
         # we start from step 1
         self.global_steps += 1
         last_val_metrics = None
-        best_test_score = float('-inf')  # Track best test score
+        best_val_accuracy = float('-inf')  # Track best validation accuracy
         best_ckpt_path = None  # Track best checkpoint path
         latest_ckpt_path = None  # Track latest checkpoint path
 
@@ -1311,10 +1261,12 @@ class RayPPOTrainer(object):
                             # Cosmo reward logic
                             decoded_responses = self.tokenizer.batch_decode(batch.batch['responses'], skip_special_tokens=True)
                             
-                            if 'hops' in batch.non_tensor_batch:
+                            if 'hop' in batch.non_tensor_batch:
+                                gold_hops = batch.non_tensor_batch['hop']
+                            elif 'hops' in batch.non_tensor_batch:
                                 gold_hops = batch.non_tensor_batch['hops']
                             else:
-                                print("Warning: 'hops' not found in batch.non_tensor_batch. Using default 0.")
+                                print("Warning: 'hop'/'hops' not found in batch.non_tensor_batch. Using default 0.")
                                 gold_hops = np.zeros(len(decoded_responses))
 
                             # Initialize mapped_rewards with same shape as rt
@@ -1463,36 +1415,11 @@ class RayPPOTrainer(object):
                         metrics.update(val_metrics)
                         
                         # Save checkpoint logic: keep best + latest (two checkpoints max)
-                        # Check if we should use THS for checkpoint selection
-                        use_ths_for_checkpoint = getattr(self.config.trainer, 'use_ths_for_checkpoint', False)
-                        
-                        if use_ths_for_checkpoint and 'val/ths' in val_metrics:
-                            # Use THS for checkpoint selection
-                            current_ths = val_metrics['val/ths']
-                            
-                            # Initialize best_ths if not already done
-                            if not hasattr(self, 'best_ths'):
-                                self.best_ths = float('-inf')
-                            
-                            is_new_best = current_ths > self.best_ths
-                            
-                            if is_new_best:
-                                self.best_ths = current_ths
-                                print("\n" + "🎯" * 40)
-                                print(f" NEW BEST THS: {self.best_ths:.4f} (prev: {self.best_ths - (current_ths - self.best_ths):.4f}) ".center(80, '🎯'))
-                                print("🎯" * 40 + "\n")
-                        else:
-                            # Default: use test_score for checkpoint selection
-                            test_scores = [v for k, v in val_metrics.items() if k.startswith('val/test_score/') and not ('answerable' in k)]
-                            if test_scores:
-                                current_test_score = sum(test_scores) / len(test_scores)
-                                is_new_best = current_test_score > best_test_score
-                                
-                                if is_new_best:
-                                    best_test_score = current_test_score
-                                    print("\n" + "🎉" * 40)
-                                    print(f" NEW BEST SCORE: {best_test_score:.4f} (prev: {best_test_score - (current_test_score - best_test_score):.4f}) ".center(80, '🎉'))
-                                    print("🎉" * 40 + "\n")
+                        # Select best checkpoint by validation accuracy (aligned with inference.py)
+                        current_acc = float(val_metrics.get('val/accuracy', 0.0))
+                        is_new_best = current_acc > best_val_accuracy
+                        if is_new_best:
+                            best_val_accuracy = current_acc
                         
                         # Save checkpoint regardless of selection method
                         with _timer('save_checkpoint', timing_raw):
@@ -1532,10 +1459,8 @@ class RayPPOTrainer(object):
                             else:
                                 print(f"💾 Keeping 2 checkpoints - Best: {best_ckpt_path}, Latest: {latest_ckpt_path}")
                         
-                        if use_ths_for_checkpoint and not is_new_best:
-                            print(f"\nℹ️  THS {current_ths:.4f} <= best {self.best_ths:.4f}\n")
-                        elif not use_ths_for_checkpoint and not is_new_best and 'current_test_score' in locals():
-                            print(f"\nℹ️  Score {current_test_score:.4f} <= best {best_test_score:.4f}\n")
+                        if not is_new_best:
+                            print(f"\nℹ️  Accuracy {current_acc:.4f} <= best {best_val_accuracy:.4f}\n")
 
                 # collect metrics
                 metrics.update(compute_data_metrics(batch=batch, use_critic=self.use_critic))

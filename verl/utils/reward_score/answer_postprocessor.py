@@ -256,13 +256,12 @@ Output: -1
         Ground Truth: {ground_truth_answer}
         Prediction: {predicted_answer}
         Output: """
-        # Call judge API (using thread pool for async execution)
+        # Call judge API
+        # IMPORTANT: do NOT submit _call_judge_api into the same thread pool here.
+        # judge_batch() already parallelizes judge_answer_correctness via ThreadPoolExecutor.
+        # Submitting again causes nested executor usage and can deadlock when max_workers is saturated.
         try:
-            # concise call log
-            
-            # Submit to thread pool and wait for result
-            future = self.executor.submit(self._call_judge_api, prompt)
-            result = future.result(timeout=self.request_timeout + 5)  # Add buffer to timeout
+            result = self._call_judge_api(prompt)
             
             # print concise result head
             

@@ -1,40 +1,29 @@
 set -x
 # /mnt/shared-storage-user/liyafu/models/DeepSeek-R1-Distill-Qwen-7B /mnt/shared-storage-user/liyafu/models/Qwen2.5-7B-Instruct
-MODEL_PATH=SFT/output/sft
-# MiniCheck model is now served via API, path not directly used by training
-#REWARD_MODEL_PATH=/mnt/shared-storage-user/liyafu/runquan/models/MiniCheck
-
-export MODEL_NAME=qwen_7b  # Model identifier for checkpoint organization
+MODEL_PATH=SFT/output/cosmosft_llama/global_step_609
+export MODEL_NAME=llama_8b  # Model identifier for checkpoint organization
 export STRATEGY=cosmo #grpo, cosmo, lcpo, think_prune
-train_files="['data/musique/train_rl.parquet', 'data/2wikimultihop/train_rl.parquet']"
-test_files="['data/musique/test.parquet', 'data/2wikimultihop/test.parquet', 'data/hotpot/test.parquet']"
+train_files="['data/HotpotQA/train_rl.parquet']"
+test_files="['data/MuSiQue/test.parquet', 'data/Halueval/test.parquet', 'data/2WikimultihopQA/test.parquet', 'data/HotpotQA/test.parquet']"
+export MODEL_TEMPLATE=llama 
+export SYSTEM_PROMPT_TYPE=cot #cot directly
+#检查ckpt删没删
 
 export NLTK_DATA=/mnt/shared-storage-user/liyafu/runquan/nltk_data
 export VLLM_ATTENTION_BACKEND=XFORMERS
 export HYDRA_FULL_ERROR=1
 export PYTHONUNBUFFERED=1
 export CUDA_VISIBLE_DEVICES=0,1,2,3
-
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 export WANDB_MODE=offline
 export RAY_memory_usage_threshold=0.98
-
 export USE_LLM_JUDGE=true
-export LLM_JUDGE_API_BASE=http://100.103.44.1:8000
+export LLM_JUDGE_API_BASE=http://localhost:8000
 export LLM_JUDGE_MODEL_NAME=/mnt/shared-storage-user/liyafu/models/Llama-3.3-70B-Instruct
 export LLM_JUDGE_API_KEY=  # Empty or your API key
 export LLM_JUDGE_MAX_WORKERS=8  # Number of concurrent judge requests
 export LLM_JUDGE_TIMEOUT=60  # Timeout per request (seconds)
-
-export SENTENCE_LAMBDA=0.5
-export SENTENCE_LAMBDA_POS=0.5
-export SENTENCE_LAMBDA_NEG=0.5
-export GRPO_VARIANCE_THRESHOLD=0
-
-export MODEL_TEMPLATE=qwen 
-
 export BETA_WARMUP_STEPS=100
-export SYSTEM_PROMPT_TYPE=cot #cot directly
 
 nohup python3 -m verl.trainer.main_ppo \
     actor_rollout_ref.actor.grad_clip=0.5 \
@@ -42,7 +31,7 @@ nohup python3 -m verl.trainer.main_ppo \
     data.train_files="$train_files" \
     data.val_files="$test_files" \
     data.train_batch_size=64 \
-    data.val_batch_size=512 \
+    data.val_batch_size=64 \
     data.max_prompt_length=8192 \
     data.max_response_length=2048 \
     data.filter_overlong_prompts=True \
@@ -80,7 +69,7 @@ nohup python3 -m verl.trainer.main_ppo \
     trainer.critic_warmup=0 \
     trainer.logger=['wandb'] \
     trainer.project_name=SMIR \
-    +trainer.val_before_train=False \
+    +trainer.val_before_train=True \
     trainer.experiment_name=$STRATEGY \
     trainer.n_gpus_per_node=4 \
     trainer.nnodes=1 \

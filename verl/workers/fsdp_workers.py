@@ -1701,6 +1701,10 @@ class RewardModelWorker(Worker):
         reasoning_reward_tensor = torch.zeros(data.batch['responses'].shape[0], dtype=torch.float32)
         sentence_mask_tensor = torch.ones_like(data.batch['responses'], dtype=torch.float32)
 
+        # Use the same LLM-as-a-Judge logic as inference.py (via AnswerPostProcessor).
+        from verl.utils.reward_score.answer_postprocessor import get_postprocessor
+        post = get_postprocessor()
+
         # perform forward computation
         with self.ulysses_sharding_manager:
             for i in range(len(data)):
@@ -1720,99 +1724,22 @@ class RewardModelWorker(Worker):
                 sequences = torch.cat((valid_prompt_ids, valid_response_ids))
                 sequences_str = self.input_tokenizer.decode(sequences)
                 sequences_input = self.input_tokenizer.decode(valid_response_ids)
-                documents = data_item.non_tensor_batch['documents'] # [[key, [list]]]
-                ground_truth = data_item.non_tensor_batch['answer'] # str
-                data_source = data_item.non_tensor_batch['data_source']
-                strategy = os.environ.get('STRATEGY', None)
-                compute_score_fn = self._select_rm_score_fn(data_source)
-                # extract answerable strictly from extra_info
-                extra_info = data_item.non_tensor_batch.get('extra_info', {})
-                if isinstance(extra_info, str):
-                    try:
-                        import json as _json
-                        extra_info = _json.loads(extra_info)
-                    except Exception:
-                        extra_info = {}
-                if not isinstance(extra_info, dict):
-                    extra_info = {}
-                raw_flag = extra_info.get('answerable', True)
-                if isinstance(raw_flag, str):
-                    rf = raw_flag.strip().lower()
-                    answerable_flag = True if rf == 'true' else False if rf == 'false' else True
-                elif isinstance(raw_flag, bool):
-                    answerable_flag = raw_flag
-                else:
-                    answerable_flag = True
-                
-                # Extract answer_aliases for data sources that support it
-                answer_aliases = extra_info.get('answer_aliases', []) if isinstance(extra_info, dict) else []
-                
-                # Call compute_score_fn with or without answer_aliases based on data source
-                if data_source in ['hotpot', '2wikimultihop', 'musique']:
-                    format_score, answer_score, base_reward = compute_score_fn(
-                        response=sequences_str,
-                        ground_truth=ground_truth,
-                        documents=documents,
-                        answerable=answerable_flag,
-                        answer_aliases=answer_aliases,
-                        enable_postprocessing=True,
-                    )
-                else:
-                    format_score, answer_score, base_reward = compute_score_fn(
-                        response=sequences_str,
-                        ground_truth=ground_truth,
-                        documents=documents,
-                        answerable=answerable_flag,
-                    )
-                # Note: base_reward is not used in training, only stored for validation
-                evidences = data_item.non_tensor_batch['evidences']
-                if strategy == 'grpo':
-                    reasoning_score = 0
-                    sentence_mask_tensor[i, :] = 0.0
-                elif strategy == 'fspo':
-                    if data_source in ["MATH", "GSM8K"]:
-                        reasoning_score = 0
-                        sentence_mask_tensor[i, :] = 0.0
-                    elif format_score == -2:
-                        reasoning_score = 0
-                        sentence_mask_tensor[i, :] = 0.0
-                        # Removed verbose print to reduce log clutter
-                        # print(f"\n[Reasoning Validation] Skipped due to format errors (Reasoning score: {reasoning_score})")
-                    else:
-                        reasoning_score, sentence_mask = self.validate_model_reasoning_documents_only(documents, sequences_input) # 标量, 一维列表且取值均为-1, 表示每个token的mask
-                        mask_length = min(len(response_ids), len(sentence_mask)) # token数
-                        sentence_mask_tensor[i, :mask_length] = torch.tensor(sentence_mask[:mask_length], dtype=torch.float32)# [batch_size, max_seq_len], 相同于把每个样本的sentence_mask打到batch里 
-                elif 'evar' in strategy:
-                    sentence_mask_tensor = torch.zeros_like(data.batch['responses'], dtype=torch.float32)
-                    if format_score == -2:
-                        reasoning_score = 0
-                        sentence_mask_tensor[i, :] = 0.0
-                        # Removed verbose print to reduce log clutter
-                        # print(f"\n[Reasoning Validation] Skipped due to format errors (Reasoning score: {reasoning_score})")
-                    else:
-                        # CRITICAL: Pass valid_response_ids directly to ensure alignment
-                        # try to get question if available in batch (optional)
-                        try:
-                            question_text = data_item.non_tensor_batch['question']
-                        except Exception:
-                            question_text = None
-
-                        reasoning_score, sentence_mask = self.validate_model_reasoning_stepwise(
-                            sequences_input,
-                            documents,
-                            evidences,
-                            valid_response_ids=valid_response_ids,
-                            question=question_text,
-                            ground_truth=ground_truth,
-                            answer_aliases=answer_aliases,
-                            answerable=answerable_flag,
-                        )
-                        # sentence_mask length MUST match valid_response_ids length
-                        mask_length = min(len(valid_response_ids), len(sentence_mask))
-                        sentence_mask_tensor[i, :mask_length] = torch.tensor(sentence_mask[:mask_length], dtype=torch.float32)
-                else:
-                    reasoning_score = 0.0
-                    sentence_mask_tensor[i, :] = 0.0
+                # Our RL parquet only contains: prompt, query, ground_truth, hop.
+                # Reward is computed from (prediction vs ground_truth) using the same judge as inference.
+                ground_truth = data_item.non_tensor_batch.get('ground_truth', '')
+                question = data_item.non_tensor_batch.get('query', '')
+                judge_score = post.judge_answer_correctness(
+                    predicted_answer=sequences_input,
+                    ground_truth_answer=ground_truth,
+                    question=question,
+                    answerable=None,
+                )
+                # Map to binary reward: 1 = correct, 0 = incorrect (no -1 / neutral)
+                answer_score = 1.0 if judge_score == 1 else 0.0
+                format_score = 0.0
+                base_reward = float(answer_score)
+                reasoning_score = 0.0
+                sentence_mask_tensor[i, :] = 0.0
 
                 # Removed verbose prints to reduce log clutter
                 # print("\n" + "-" * 80)
@@ -1825,15 +1752,8 @@ class RewardModelWorker(Worker):
                 except Exception:
                     # Fallback: best-effort conversion
                     resp_len_int = int(valid_response_length) if not isinstance(valid_response_length, torch.Tensor) else int(valid_response_length.detach().cpu().item())
-                # 当token超过500时，每多100token，reward减去0.1
-                if resp_len_int > 500:
-                    excess_tokens = resp_len_int - 500
-                    # 计算超出的100token的数量，向上取整
-                    excess_hundreds = (excess_tokens + 99) // 100
-                    length_penalty = 0.1 * excess_hundreds
-                else:
-                    length_penalty = 0.0
-                total_score = float(answer_score) - length_penalty
+                # Keep reward strictly in {0,1} as requested (no length penalty here)
+                total_score = float(answer_score)
 
                 reward_tensor[i, valid_response_length - 1] = total_score
 
