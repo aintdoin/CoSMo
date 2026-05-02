@@ -12,25 +12,25 @@ build-backend = "setuptools.build_meta"
 # project (PEP 621 metadata)
 # -------------------------------
 [project]
-name = "verl"
+name = "cosmo"
 # We'll mark the version as "dynamic" because it's read from the file "verl/version/version" 
 # (PEP 621 calls this "dynamic version"). 
 # The actual version is specified in the [tool.setuptools.dynamic] section below.
 dynamic = ["version"]
 
-description = "verl: Volcano Engine Reinforcement Learning for LLM"
+description = "CoSMo: Consistency-Guided Split-Merge Optimization"
 license = {file = "LICENSE"}  # or "Apache-2.0", if you prefer an SPDX identifier
 readme = {file = "README.md", content-type = "text/markdown"}
 requires-python = ">=3.8"
 
 authors = [
-  { name = "Bytedance - Seed - MLSys", email = "zhangchi.usc1992@bytedance.com" },
-  { name = "Bytedance - Seed - MLSys", email = "gmsheng@connect.hku.hk" },
+  { name = "Runquan Gui" },
 ]
 
 # Dependencies corresponding to install_requires in setup.py
 dependencies = [
     "accelerate",
+    "aiohttp",
     "codetiming",
     "datasets",
     "dill",
@@ -42,7 +42,10 @@ dependencies = [
     "pybind11",
     "pylatexenc",
     "ray>=2.10",
+    "requests",
     "tensordict<0.6",
+    "torch",
+    "torchdata",
     "transformers",
     "vllm<=0.6.3",
     'wandb',
@@ -58,7 +61,7 @@ gpu = ["liger-kernel", "flash-attn"]
 
 # URLs
 [project.urls]
-Homepage = "https://github.com/volcengine/verl"
+Homepage = "https://github.com/RunquanGui/CoSMo"
 
 # -------------------------------
 # tool.setuptools - Additional config

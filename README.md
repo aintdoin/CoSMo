@@ -1,167 +1,101 @@
-<div align='center'>
-<h1>The Hallucination Dilemma: Factuality-Aware Reinforcement Learning for Large Reasoning Models</h1>
+# CoSMo
 
-<!-- TODO:  Thread,Paper,Dataset,Weights-->
-[![Paper](https://img.shields.io/badge/paper-5f16a8?style=for-the-badge&logo=arxiv&logoColor=white)](https://www.arxiv.org/pdf/2505.24630)
-[![Dataset](https://img.shields.io/badge/Datasets-4d8cd8?style=for-the-badge&logo=huggingface&logoColor=white)]()
-[![Weights](https://img.shields.io/badge/Model%20Weights-63cad3?style=for-the-badge&logo=huggingface&logoColor=white)]()
-</div>
+Code for **Short Chains, Deep Thoughts: Balancing Reasoning Efficiency and Intra-Segment Capability via Split-Merge Optimization**.
 
-> [!IMPORTANT]
-> **🔥 News!!!**
-> - [2025/06/02] We release our code, data for reproducing our work.
-> - [2025/05/30] We release our paper "The Hallucination Dilemma: Factuality-Aware Reinforcement Learning for Large Reasoning Models" on arXiv.
+CoSMo has two stages:
 
-We propose **F**actuality-aware **S**tep-wise **P**olicy **O**ptimization (**FSPO**), an innovative RL fine-tuning algorithm incorporating explicit factuality verification at each reasoning step. FSPO leverages automated verification against given evidence to dynamically adjust token-level advantage values, incentivizing factual correctness throughout the reasoning process. Our algorithm is based on the awesome [verl](https://github.com/volcengine/verl) framework. Thanks for their great work!
+1. **SFT data construction with Split-Merge Optimization**: Qwen2.5-72B-Instruct acts as the judge and generator. The pipeline keeps every reasoning unit inside XML blocks, `<seg>...</seg>`, then iteratively merges redundant adjacent segments or splits coarse segments.
+2. **Structure-aligned RL**: verl/GRPO trains the SFT model with a segment-level budget reward when `golden_segments` is available: `r = r_format + r_correctness - |N - golden_segments|`. Token length inside each segment is not penalized. If `golden_segments` is missing, the reward falls back to standard answer-based GRPO.
 
-## Key Results
-
-### Reasoning and Factuality Performance
-
-🚀 On hallucination benchmarks, FSPO clearly outperforms all open-source, reasoning and even some API-based models. On reasoning benchmarks, FSPO achieves superior results within the open-source category, notably surpassing other base models like Qwen2.5-7B-Instruct and Llama3.1-8B-Instruct by significant margins (e.g., GSM8K 89.5% vs. 73.2% and 77.5%, respectively).
-
-![alt text](assets/main.png)
-
-### Ablation and Generalization
-
-![alt text](assets/ab.png)
-
-### Number of Samples and Factuality Improvement
-
-![alt text](assets/cd.png)
-
-## Reproducibility
-
-To benefit the broader research community, we fully open-source the recipe of our RL training, including algorithm details, dataset, and infrastructures.
-
-### Environment Setup
-
-We recommend using conda to setup the environment:
+## Install
 
 ```bash
-conda create -n fspo python=3.10
-conda activate fspo
-pip3 install -r requirements.txt
+conda create -n cosmo python=3.10
+conda activate cosmo
+pip install -r requirements.txt
+pip install -e .
 ```
 
-### Datasets
-We provide the post-processed training and evaluation datasets for FSPO at the [data](https://github.com/turboLJY/FSPO/tree/master/data) directory.
+## Data Format
 
-If you want to process the original datasets by yourself, you can first download the SimpleRL dataset (~8K) from [simpleRL-reason](https://github.com/hkust-nlp/simpleRL-reason) and the challenging HotpotQA subset (~2K) from [R1-Searcher](https://github.com/RUCAIBox/R1-Searcher) as our raw training dataset. Then, you can run ```math_dataset.py```, ```hotpot.py``` scripts in the directory [examples/data_preprocess](https://github.com/turboLJY/FSPO/tree/master/examples/data_preprocess) to process them. For evaluation, you can download TruthfulQA, HalluQA, HaluEval, GSM8K, MATH-500, AIME2024, AIME2025 from their sources and use the scripts in the directory [examples/data_preprocess](https://github.com/turboLJY/FSPO/tree/master/examples/data_preprocess) to process them.
+This repository does not currently include dataset-specific preprocessing scripts. Before running SFT or RL, convert the data to parquet files such as `data/<dataset>/<split>.parquet`.
 
-### Training
-
-The core code relevant to our algortihm lies in line 150-152 in ```ray_trainer.py``` to adjust the token advantage values:
+Currently supported datasets are HotpotQA, 2WikiMultihopQA, MuSiQue, HaluEval, NQ, CRAG, MATH500, and GSM8K. Use the same parquet row contract across datasets:
 
 ```python
-sentence_mask = data.batch['sentence_mask']
-flip_mask = (sentence_mask * advantages) >= 0.0
-advantages = torch.where(flip_mask, advantages, -advantages)
-```
-
-To run the training based on different models, you can run the following command:
-
-```bash
-bash main_grpo_qwen_base.sh
-bash main_grpo_qwen_instruct.sh
-bash main_grpo_llama_instruct.sh
-```
-
-### Inference
-
-Since verl stores the model weights in shard checkpoints, I provide the following code to combine them for inference:
-
-```python
-def load_sharded_model(fsdp_checkpoint_path):
-    state_dict = defaultdict(list)
-    checkpoint_dir = Path(fsdp_checkpoint_path)
-
-    shard_files = list(checkpoint_dir.glob("model_world_size_*_rank_*.pt"))
-    if not shard_files:
-        raise ValueError(f"No checkpoint files found in {fsdp_checkpoint_path}")
-
-    pattern = re.compile(r"model_world_size_(\d+)_rank_(\d+)\.pt")
-    world_sizes = set()
-    for file in shard_files:
-        match = pattern.match(file.name)
-        if match:
-            world_sizes.add(int(match.group(1)))
-
-    if len(world_sizes) != 1:
-        raise ValueError(
-            f"Inconsistent world_size found in checkpoint files: {world_sizes}"
-        )
-
-    world_size = world_sizes.pop()
-    print(f"Found checkpoints with world_size = {world_size}")
-
-    for rank in range(world_size):
-        filepath = checkpoint_dir / f"model_world_size_{world_size}_rank_{rank}.pt"
-        if not filepath.exists():
-            raise ValueError(f"Missing shard file: {filepath}")
-
-        print(f"Loading shard: {filepath}")
-        shard_dict = torch.load(filepath, weights_only=False)
-
-        for key, value in shard_dict.items():
-            if hasattr(value, "to_local"):
-                value = value.to_local()
-            state_dict[key].append(value)
-
-    consolidated_state_dict = {}
-    for key in state_dict:
-        try:
-            consolidated_state_dict[key] = torch.cat(state_dict[key], dim=0)
-        except (RuntimeError, TypeError):
-            consolidated_state_dict[key] = state_dict[key][0]
-            print(
-                f"Parameter '{key}' does not need concatenation, using first shard value"
-            )
-
-    return consolidated_state_dict
-
-
-def initialize_model_and_tokenizer(local_path, trust_remote_code=True, torch_dtype=torch.bfloat16):
-    tokenizer = hf_tokenizer(local_path, trust_remote_code=trust_remote_code)
-
-    actor_model_config = AutoConfig.from_pretrained(local_path, trust_remote_code=trust_remote_code)
-    actor_module = AutoModelForCausalLM.from_pretrained(
-        pretrained_model_name_or_path=local_path,
-        torch_dtype=torch_dtype,
-        config=actor_model_config,
-        attn_implementation="flash_attention_2",
-        trust_remote_code=trust_remote_code,
-    )
-
-    return tokenizer, actor_module
-
-tokenizer, model = initialize_model_and_tokenizer(args.base_model_path)
-state_dict = load_sharded_model(args.shared_ckpt_path)
-model.load_state_dict(state_dict)
-model.to(torch.bfloat16)
-model.to(device)
-```
-
-You can run the scripts in [/evaluate](https://github.com/nusnlp/FSPO/tree/master/evaluate) directory to conduct inference. For example, 
-
-```bash
-eval_truthfulqa.sh
-```
-
-## Acknowledgement and Citation
-
-We thank the [verl](https://github.com/volcengine/verl) for providing the awesome open-source RL infrastructure.
-
-If you use the data or code in this repo, please cite the following paper:
-
-```
-@inproceedings{FSPO,
-  author = {Junyi Li and Hwee Tou Ng},
-  title = {The Hallucination Dilemma: Factuality-Aware Reinforcement Learning for Large Reasoning Models},
-  year = {2025},
-  eprint={2505.24630},
-  archivePrefix={arXiv},
-  primaryClass={cs.CL},
-  url={https://arxiv.org/abs/2505.24630}, 
+{
+    "prompt": "Question and optional references/context shown to the model.",
+    "response": "<think>\n<seg>...</seg>\n</think>\n<answer>...</answer>",
+    "answer": "gold answer",
+    "ground_truth": "gold answer, optional alias for RL",
+    "golden_segments": 2,
+    "extra_info": {"index": 0}
 }
 ```
+
+`prompt` is required. `response` is required for `python main_sft.py --stage train`; it can be omitted during `--stage prepare` only if `--generate-missing` is used. RL data should contain `prompt` and either `ground_truth` or `answer`.
+
+`golden_segments` is optional and should be a positive integer segment target. When HotpotQA, 2WikiMultihopQA, or MuSiQue is used as training data, providing `golden_segments` is recommended so Split-Merge SFT and RL can align to the intended hop/segment count. If it is absent, SFT uses the no-gold pairwise split-merge path, and RL degrades to answer-based GRPO.
+
+## LLM Judge Deployment
+
+SFT preparation uses an OpenAI-compatible LLM judge/generator. The provided script starts a vLLM server without hard-coded personal paths:
+
+```bash
+MODEL_PATH=/path/to/Qwen2.5-72B-Instruct \
+SERVED_MODEL_NAME=Qwen/Qwen2.5-72B-Instruct \
+CUDA_VISIBLE_DEVICES=0,1,2,3 \
+TENSOR_PARALLEL_SIZE=4 \
+PORT=8000 \
+bash LLM_judge.sh
+```
+
+Then point CoSMo to the service:
+
+```bash
+export COSMO_API_BASE=http://localhost:8000/v1
+export COSMO_API_KEY=EMPTY
+export COSMO_JUDGE_MODEL=Qwen/Qwen2.5-72B-Instruct
+```
+
+## Stage 1: SFT
+
+Prepare HotpotQA SFT data:
+
+```bash
+python main_sft.py \
+  --stage prepare \
+  --dataset hotpotqa \
+  --input data/hotpotqa/train.parquet \
+  --sft-data data/sft/hotpotqa_cosmo.parquet \
+  --generate-missing
+```
+
+Train the SFT model with the bundled verl FSDP SFT trainer. The default backbone is `Llama-3.1-8B-Instruct`; use `--backbone qwen` for `Qwen2.5-7B-Instruct`. By default `--lora-rank 0` runs full-model SFT so the checkpoint can be loaded directly by the RL stage.
+
+```bash
+python main_sft.py \
+  --stage train \
+  --backbone llama \
+  --sft-data data/sft/hotpotqa_cosmo.parquet \
+  --output-dir checkpoints/cosmo_sft
+```
+
+verl saves step checkpoints under `checkpoints/cosmo_sft/global_step_*`; `main_sft.py` links the latest one to `checkpoints/cosmo_sft/final` for the RL stage.
+If you enable LoRA with `--lora-rank > 0`, merge the adapter into the base model before using the checkpoint as `--sft-model`.
+
+Expected SFT training columns are `prompt` and `response`. If the input rows contain `golden_segments`, `gold_hops`, `hop`, or `hops`, CoSMo aligns the segment count to that target. For HotpotQA, 2WikiMultihopQA, and MuSiQue this uses the golden segment path when the target is provided; for HaluEval, GSM8K, NQ, CRAG, and MATH500 it falls back to iterative pairwise merge then per-segment split until convergence or the iteration limit.
+
+## Stage 2: RL
+
+Run GRPO from the SFT checkpoint on HotpotQA and HaluEval:
+
+```bash
+python main_rl.py \
+  --sft-model checkpoints/cosmo_sft/final \
+  --train-files data/rl/hotpotqa.parquet data/rl/halueval.parquet \
+  --val-files data/rl/hotpotqa_val.parquet data/rl/halueval_val.parquet \
+  --output-dir checkpoints/cosmo_rl
+```
+
+RL data should contain `prompt`, a ground-truth answer column such as `ground_truth` or `answer`, and a segment target such as `golden_segments`, `hop`, or `hops` when available. The CoSMo reward manager enforces the `<think><seg>...</seg></think><answer>...</answer>` format and applies the segment-budget penalty only when a segment target exists; otherwise it falls back to standard GRPO correctness reward.

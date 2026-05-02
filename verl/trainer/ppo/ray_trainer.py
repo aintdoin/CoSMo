@@ -518,7 +518,8 @@ class RayPPOTrainer(object):
                                          filter_prompts=self.config.data.filter_overlong_prompts,
                                          return_raw_chat=self.config.data.get('return_raw_chat', False),
                                          truncation='error',
-                                         disable_unanswerable=_env_disable_unans)
+                                         disable_unanswerable=_env_disable_unans,
+                                         model_template=self.config.data.get('model_template', 'qwen'))
         # Optional: subset training data for flexible debugging
         start_index = int(self.config.data.get('start_index', 0) or 0)
         max_samples = self.config.data.get('max_samples', None)
@@ -556,7 +557,8 @@ class RayPPOTrainer(object):
                                        filter_prompts=self.config.data.filter_overlong_prompts,
                                        return_raw_chat=self.config.data.get('return_raw_chat', False),
                                        truncation='error',
-                                       disable_unanswerable=False)
+                                       disable_unanswerable=False,
+                                       model_template=self.config.data.get('model_template', 'qwen'))
         self.val_dataloader = DataLoader(dataset=self.val_dataset,
                                          batch_size=len(self.val_dataset),
                                          num_workers=8,
@@ -666,12 +668,8 @@ class RayPPOTrainer(object):
             return name
 
         def _count_segments(text: str) -> int:
-            if not isinstance(text, str) or not text:
-                return 0
-            m = re.search(r'<think>(.*?)</think>', text, re.DOTALL | re.IGNORECASE)
-            content = m.group(1) if m else text
-            enum_pattern = re.compile(r'(?m)^(\s*)(\d+)\.(\s*)')
-            return len(list(enum_pattern.finditer(content)))
+            from cosmo.segments import count_segments
+            return count_segments(text)
 
         # Use the same LLM-as-a-Judge as inference.py
         from verl.utils.reward_score.answer_postprocessor import get_postprocessor
@@ -861,7 +859,8 @@ class RayPPOTrainer(object):
                              filter_prompts=self.config.data.filter_overlong_prompts,
                              return_raw_chat=self.config.data.get('return_raw_chat', False),
                              truncation='error',
-                             disable_unanswerable=False)
+                             disable_unanswerable=False,
+                             model_template=self.config.data.get('model_template', 'qwen'))
             if len(ds) == 0:
                 per = {"val/accuracy": 0.0, "val/avg_token_cost": 0.0, "val/avg_segments": 0.0, "_n": 0,
                        "_sum_correct": 0.0, "_sum_tokens": 0.0, "_sum_segments": 0.0,
@@ -1258,51 +1257,9 @@ class RayPPOTrainer(object):
                         minus_one = -one
                         
                         if strategy == 'cosmo':
-                            # Cosmo reward logic
-                            decoded_responses = self.tokenizer.batch_decode(batch.batch['responses'], skip_special_tokens=True)
-                            
-                            if 'hop' in batch.non_tensor_batch:
-                                gold_hops = batch.non_tensor_batch['hop']
-                            elif 'hops' in batch.non_tensor_batch:
-                                gold_hops = batch.non_tensor_batch['hops']
-                            else:
-                                print("Warning: 'hop'/'hops' not found in batch.non_tensor_batch. Using default 0.")
-                                gold_hops = np.zeros(len(decoded_responses))
-
-                            # Initialize mapped_rewards with same shape as rt
-                            mapped_rewards = torch.zeros_like(rt)
-                            
-                            # Get valid response lengths to place rewards
-                            response_len = batch.batch['responses'].shape[-1]
-                            response_mask = batch.batch['attention_mask'][:, -response_len:]
-                            valid_response_lengths = response_mask.sum(dim=-1).long()
-
-                            for i, resp in enumerate(decoded_responses):
-                                # Extract steps from <think> block
-                                step_count = 0
-                                think_match = re.search(r'<think>(.*?)</think>', resp, re.DOTALL)
-                                if think_match:
-                                    think_content = think_match.group(1)
-                                    steps = re.findall(r'^\s*\d+\.', think_content, re.MULTILINE)
-                                    step_count = len(steps)
-                                
-                                is_correct = pos_mask[i].any().item()
-                                gold = float(gold_hops[i]) if gold_hops[i] is not None else 0.0
-                                
-                                r = 0.0
-                                if is_correct:
-                                    r += 2.0
-                                    if abs(step_count - gold) <= 1:
-                                        r += 1.0
-                                    else:
-                                        r -= 1.0
-                                else:
-                                    r += 0.0
-                                
-                                # Place reward at the last valid token
-                                idx = valid_response_lengths[i] - 1
-                                if idx >= 0:
-                                    mapped_rewards[i, idx] = r
+                            # CoSMoRewardManager already computes:
+                            # r = r_format + r_correctness - |N - golden_segments|.
+                            mapped_rewards = rt
                         elif strategy == 'grpo':
                             # 正确 +1，错误 / miss 均 +0
                             mapped_rewards = torch.where(pos_mask, one, zero)
@@ -1354,7 +1311,7 @@ class RayPPOTrainer(object):
                             
                             mapped_rewards = torch.tensor(new_rewards, device=rt.device, dtype=rt.dtype)
                         else:
-                            # 兜底：按 TruthRL 处理
+                            # Fallback: signed correctness reward.
                             mapped_rewards = torch.where(
                                 pos_mask, one, torch.where(neg_mask, minus_one, zero)
                             )

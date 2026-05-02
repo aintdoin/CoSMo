@@ -135,6 +135,9 @@ def main_task(config):
     elif reward_manager_name == 'prime':
         from verl.workers.reward_manager import PrimeRewardManager
         reward_manager_cls = PrimeRewardManager
+    elif reward_manager_name == 'cosmo':
+        from verl.workers.reward_manager import CoSMoRewardManager
+        reward_manager_cls = CoSMoRewardManager
     else:
         raise NotImplementedError
 

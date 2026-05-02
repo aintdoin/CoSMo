@@ -1152,25 +1152,7 @@ class RewardModelWorker(Worker):
         self.reward_module = self._build_model(config=self.config)
 
     def _select_rm_score_fn(self, data_source):
-        from verl.utils.reward_score import gsm8k, math, multiply, countdown, kk, halueval, hotpot
-        if data_source == 'GSM8K':
-            return gsm8k.compute_score
-        elif data_source == 'MATH':
-            return math.compute_score
-        elif "multiply" in data_source or "arithmetic" in data_source:
-            return multiply.compute_score
-        elif "countdown" in data_source:
-            return countdown.compute_score
-        elif "kk" in data_source:
-            return kk.compute_score
-        elif data_source == 'halueval':
-            return halueval.compute_score
-        elif data_source == 'ASQA':
-            return asqa.compute_score
-        elif data_source in ['hotpot', '2wikimultihop', 'musique_ans', 'musique']:
-            return hotpot.compute_score
-        else:
-            raise NotImplementedError
+        raise NotImplementedError("CoSMo uses function-based CoSMoRewardManager instead of legacy reward scorers.")
 
     def extract_solution(self, solution_str: str) -> str:
         """Extracts the final answer from the model's response string.

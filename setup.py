@@ -12,7 +12,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-# setup.py is the fallback installation script when pyproject.toml does not work
 from setuptools import setup, find_packages
 import os
 
@@ -23,6 +22,7 @@ with open(os.path.join(version_folder, 'verl/version/version')) as f:
 
 install_requires = [
   'accelerate',
+  'aiohttp',
   'codetiming',
   'datasets',
   'dill',
@@ -34,7 +34,10 @@ install_requires = [
   'pybind11',
   'pylatexenc',
   'ray>=2.10',
+  'requests',
   'tensordict<0.6',
+  'torch',
+  'torchdata',
   'transformers',
   'vllm<=0.6.3',
   'wandb',
@@ -55,15 +58,14 @@ this_directory = Path(__file__).parent
 long_description = (this_directory / "README.md").read_text()
 
 setup(
-    name='verl',
+    name='cosmo',
     version=__version__,
     package_dir={'': '.'},
     packages=find_packages(where='.'),
-    url='https://github.com/volcengine/verl',
+    url='https://github.com/RunquanGui/CoSMo',
     license='Apache 2.0',
-    author='Bytedance - Seed - MLSys',
-    author_email='zhangchi.usc1992@bytedance.com, gmsheng@connect.hku.hk',
-    description='verl: Volcano Engine Reinforcement Learning for LLM',
+    author='Runquan Gui',
+    description='CoSMo: Consistency-Guided Split-Merge Optimization',
     install_requires=install_requires,
     extras_require=extras_require,
     package_data={'': ['version/*'],
