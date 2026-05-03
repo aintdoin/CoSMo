@@ -62,8 +62,6 @@ def run_prepare(args: argparse.Namespace) -> None:
     ]
     if args.max_samples:
         cmd += ["--max-samples", str(args.max_samples)]
-    if args.generate_missing:
-        cmd.append("--generate-missing")
     subprocess.run(cmd, check=True)
 
 
@@ -108,7 +106,6 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--output-dir", default="checkpoints/cosmo_sft")
 
     parser.add_argument("--max-samples", type=int, default=0)
-    parser.add_argument("--generate-missing", action="store_true")
     parser.add_argument("--max-iterations", type=int, default=5)
     parser.add_argument("--chunk-size", type=int, default=128)
     parser.add_argument("--concurrency", type=int, default=int(os.environ.get("COSMO_CONCURRENCY", "16")))

@@ -53,8 +53,6 @@ async def run(args: argparse.Namespace) -> None:
             client=client,
             dataset=args.dataset,
             max_iterations=args.max_iterations,
-            generate_missing=args.generate_missing,
-            seed_max_tokens=args.seed_max_tokens,
             chunk_size=args.chunk_size,
         )
 
@@ -72,8 +70,6 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max-samples", type=int, default=0)
     parser.add_argument("--max-iterations", type=int, default=5)
     parser.add_argument("--chunk-size", type=int, default=128)
-    parser.add_argument("--generate-missing", action="store_true", help="Use the 72B model to generate seed reasoning if no response exists.")
-    parser.add_argument("--seed-max-tokens", type=int, default=2048)
 
     parser.add_argument("--api-base", default=os.environ.get("COSMO_API_BASE", "http://localhost:8000/v1"))
     parser.add_argument("--api-key", default=os.environ.get("COSMO_API_KEY", "EMPTY"))

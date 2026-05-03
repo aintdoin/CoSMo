@@ -10,7 +10,7 @@ from cosmo.segments import ANSWER_PATTERN, SEGMENT_PATTERN
 from verl import DataProto
 
 
-GOLDEN_SEGMENT_KEYS = ("golden_segments", "gold_segments", "gold_hops", "hops", "hop", "num_hops")
+GOLDEN_SEGMENT_KEYS = ("golden_segments",)
 
 
 def _normalize(text: Any) -> str:
@@ -43,19 +43,6 @@ def _as_list(value: Any) -> list[str]:
 def _extract_answer(text: str) -> str:
     match = ANSWER_PATTERN.search(text or "")
     return match.group(1).strip() if match else ""
-
-
-def _strip_xml_tags(text: str) -> str:
-    return re.sub(r"<[^>]*>", " ", text or "", flags=re.DOTALL).strip()
-
-
-def _extract_answer_for_grpo(text: str) -> str:
-    tagged_answer = _extract_answer(text)
-    if tagged_answer:
-        return tagged_answer
-    stripped = _strip_xml_tags(text)
-    lines = [line.strip() for line in stripped.splitlines() if line.strip()]
-    return lines[-1] if lines else " ".join(stripped.split())
 
 
 def _xml_segment_count(text: str) -> int:
@@ -131,14 +118,12 @@ def _coerce_positive_int(value: Any) -> Optional[int]:
 def _get_ground_truth(item) -> list[str]:
     nt = item.non_tensor_batch
     candidates: list[Any] = []
-    for key in ("ground_truth", "answer", "answers", "target"):
-        if key in nt:
-            candidates.append(nt.get(key))
+    if "ground_truth" in nt:
+        candidates.append(nt.get("ground_truth"))
 
     reward_model = _get_nested_dict(nt.get("reward_model"))
-    for key in ("ground_truth", "answer", "answers", "target"):
-        if key in reward_model:
-            candidates.append(reward_model.get(key))
+    if "ground_truth" in reward_model:
+        candidates.append(reward_model.get("ground_truth"))
 
     answers: list[str] = []
     for candidate in candidates:
@@ -171,7 +156,7 @@ def _answer_score(prediction: str, ground_truths: Iterable[str]) -> float:
 
 
 class CoSMoRewardManager:
-    """CoSMo reward, with answer-only GRPO fallback when no segment target exists."""
+    """CoSMo reward with a required golden segment budget."""
 
     def __init__(self, tokenizer, num_examine) -> None:
         self.tokenizer = tokenizer
@@ -201,10 +186,9 @@ class CoSMoRewardManager:
             ground_truths = _get_ground_truth(item)
 
             if golden_segments is None:
-                answer = _extract_answer_for_grpo(response_text)
-                answer_score = _answer_score(answer, ground_truths)
-                total = answer_score
-                format_score = 0.0
+                total = -1.0
+                format_score = -1.0
+                answer_score = 0.0
                 base_score = answer_score
             elif not _valid_format(response_text):
                 total = -1.0

@@ -121,17 +121,6 @@ class SFTDataset(Dataset):
         else:
             self.prompts = self.prompts.tolist()
 
-        # Check if response_key exists, if not try 'answer' or 'response' as fallback
-        if len(self.response_key) == 1:
-            key = self.response_key[0]
-            if key not in self.dataframe.columns:
-                if key == 'response' and 'answer' in self.dataframe.columns:
-                    print(f"Warning: 'response' column not found, using 'answer' instead.")
-                    self.response_key = ['answer']
-                elif key == 'answer' and 'response' in self.dataframe.columns:
-                    print(f"Warning: 'answer' column not found, using 'response' instead.")
-                    self.response_key = ['response']
-
         self.responses = self.dataframe[self.response_key]
         for key in self.response_dict_keys:
             try:

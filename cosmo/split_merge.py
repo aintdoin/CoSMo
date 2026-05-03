@@ -1,5 +1,6 @@
 import asyncio
 import json
+import math
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Dict, Iterable, List, Optional
 
@@ -7,11 +8,8 @@ from .async_llm import AsyncOpenAIChatClient, LLMRequestError
 from .prompts import (
     MERGE_GENERATOR_PROMPT,
     MERGE_JUDGE_PROMPT,
-    PAIRWISE_MERGE_PROMPT,
-    SINGLE_SPLIT_PROMPT,
     SPLIT_GENERATOR_PROMPT,
     SPLIT_JUDGE_PROMPT,
-    STRUCTURED_REASONING_SYSTEM_PROMPT,
     render_prompt,
 )
 from .segments import clean_segment, extract_answer, extract_segments, format_response
@@ -20,7 +18,7 @@ if TYPE_CHECKING:
     import pandas as pd
 
 
-GOLDEN_SEGMENT_KEYS = ("golden_segments", "gold_segments", "gold_hops", "hops", "hop", "num_hops")
+GOLDEN_SEGMENT_KEYS = ("golden_segments",)
 
 
 @dataclass
@@ -144,30 +142,6 @@ class SplitMergeOptimizer:
             return segments[:2]
         return [clean_segment(segment)]
 
-    async def pairwise_merge_or_keep(self, left: str, right: str) -> List[str]:
-        data = await self._json_prompt(render_prompt(PAIRWISE_MERGE_PROMPT, segment_1=left, segment_2=right))
-        decision = str(data.get("decision", "")).strip().lower()
-        raw_segments = data.get("segments", [])
-        if not isinstance(raw_segments, list):
-            raw_segments = []
-        segments = [clean_segment(s) for s in raw_segments if clean_segment(s)]
-        if decision == "merge":
-            return [segments[0] if segments else clean_segment(f"{left} {right}")]
-        if len(segments) >= 2:
-            return segments[:2]
-        return [clean_segment(left), clean_segment(right)]
-
-    async def split_or_keep(self, segment: str) -> List[str]:
-        data = await self._json_prompt(render_prompt(SINGLE_SPLIT_PROMPT, segment=segment))
-        decision = str(data.get("decision", "")).strip().lower()
-        raw_segments = data.get("segments", [])
-        if not isinstance(raw_segments, list):
-            raw_segments = []
-        segments = [clean_segment(s) for s in raw_segments if clean_segment(s)]
-        if decision == "split" and len(segments) >= 2:
-            return segments[:2]
-        return [segments[0] if segments else clean_segment(segment)]
-
     async def run_with_gold(self, segments: Iterable[str], golden_segments: int) -> SplitMergeResult:
         current = [clean_segment(s) for s in segments if clean_segment(s)]
         iterations = 0
@@ -202,85 +176,33 @@ class SplitMergeOptimizer:
             status = "aligned"
         return SplitMergeResult(segments=current, answer="", iterations=iterations, status=status)
 
-    async def run_without_gold(self, segments: Iterable[str]) -> SplitMergeResult:
-        current = [clean_segment(s) for s in segments if clean_segment(s)]
-        status = "unchanged"
-        iterations = 0
-
-        for iterations in range(1, self.max_iterations + 1):
-            modified = False
-
-            merged: List[str] = []
-            idx = 0
-            while idx < len(current):
-                if idx + 1 >= len(current):
-                    merged.append(current[idx])
-                    idx += 1
-                    continue
-                result = await self.pairwise_merge_or_keep(current[idx], current[idx + 1])
-                if len(result) == 1:
-                    merged.extend(result)
-                    idx += 2
-                    modified = True
-                    status = "merged"
-                else:
-                    merged.append(result[0])
-                    current[idx + 1] = result[1]
-                    idx += 1
-
-            split: List[str] = []
-            for segment in merged:
-                result = await self.split_or_keep(segment)
-                if len(result) > 1:
-                    modified = True
-                    status = "split"
-                split.extend(result)
-
-            current = split
-            if not modified:
-                status = "converged"
-                break
-
-        return SplitMergeResult(segments=current, answer="", iterations=iterations, status=status)
-
-    async def refine(self, text: str, answer: str = "", golden_segments: Optional[int] = None) -> SplitMergeResult:
+    async def refine(self, text: str, answer: str = "", golden_segments: int = 0) -> SplitMergeResult:
         segments = extract_segments(text)
         if not segments:
             return SplitMergeResult(segments=[], answer=answer, iterations=0, status="no_segments")
-        if golden_segments is not None and golden_segments > 0:
-            result = await self.run_with_gold(segments, golden_segments)
-        else:
-            result = await self.run_without_gold(segments)
+        if golden_segments <= 0:
+            raise ValueError("`golden_segments` must be a positive integer.")
+        result = await self.run_with_gold(segments, golden_segments)
         result.answer = answer
         return result
 
 
 def build_prompt_from_row(row: Dict) -> str:
-    if row.get("prompt"):
-        return str(row["prompt"])
-    question = row.get("question", "")
-    references = row.get("references", row.get("documents", row.get("context", "")))
-    if references:
-        return f"References:\n{references}\n\nQuestion:\n{question}"
-    return str(question)
+    return require_text_field(row, "prompt")
 
 
 def build_seed_text(row: Dict) -> str:
-    for key in ("generated_text", "response", "reasoning", "thought", "cot"):
-        if row.get(key):
-            return str(row[key])
-    return ""
+    value = row.get("response")
+    if value is None or (isinstance(value, float) and math.isnan(value)) or not str(value).strip():
+        raise ValueError("Input row is missing required `response`.")
+    return str(value)
 
 
-async def generate_seed(client: AsyncOpenAIChatClient, prompt: str, max_tokens: int = 2048) -> str:
-    return await client.chat(
-        [
-            {"role": "system", "content": STRUCTURED_REASONING_SYSTEM_PROMPT},
-            {"role": "user", "content": prompt},
-        ],
-        temperature=0.2,
-        max_tokens=max_tokens,
-    )
+def require_text_field(row: Dict, key: str) -> str:
+    value = row.get(key)
+    if value is None or (isinstance(value, float) and math.isnan(value)) or not str(value).strip():
+        raise ValueError(f"Input row is missing required `{key}`.")
+    return str(value)
 
 
 async def process_row(
@@ -288,18 +210,15 @@ async def process_row(
     client: AsyncOpenAIChatClient,
     dataset: str,
     max_iterations: int,
-    generate_missing: bool,
-    seed_max_tokens: int,
 ) -> Dict:
     prompt = build_prompt_from_row(row)
     seed_text = build_seed_text(row)
-    if not seed_text and generate_missing:
-        seed_text = await generate_seed(client, prompt, max_tokens=seed_max_tokens)
 
-    answer = extract_answer(seed_text, fallback=row.get("answer", row.get("ground_truth", "")))
+    ground_truth = require_text_field(row, "ground_truth")
+    answer = extract_answer(seed_text, fallback=ground_truth)
     golden_segments = extract_golden_segments(row)
     if not has_golden_segments(golden_segments):
-        golden_segments = None
+        raise ValueError("Input row is missing required positive integer `golden_segments`.")
 
     optimizer = SplitMergeOptimizer(client=client, max_iterations=max_iterations)
     try:
@@ -320,7 +239,7 @@ async def process_row(
     return {
         "prompt": prompt,
         "response": response,
-        "answer": answer,
+        "ground_truth": ground_truth,
         "golden_segments": golden_segments,
         "segments": len(result.segments),
         "status": result.status,
@@ -334,8 +253,6 @@ async def process_dataframe(
     client: AsyncOpenAIChatClient,
     dataset: str,
     max_iterations: int = 5,
-    generate_missing: bool = False,
-    seed_max_tokens: int = 2048,
     chunk_size: int = 128,
 ) -> "pd.DataFrame":
     import pandas as pd
@@ -350,8 +267,6 @@ async def process_dataframe(
                 client=client,
                 dataset=dataset,
                 max_iterations=max_iterations,
-                generate_missing=generate_missing,
-                seed_max_tokens=seed_max_tokens,
             )
             for row in chunk
         ]
